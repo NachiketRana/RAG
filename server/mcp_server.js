@@ -19,7 +19,7 @@ export const server = new McpServer({
 });
 
 // Hardcoded schema intentionally omitting sensitive fields like 'password_hash'
-const SCHEMA_DESCRIPTION = `
+export const SCHEMA_DESCRIPTION = `
 Database Schema (PostgreSQL):
 
 Table: users
@@ -37,6 +37,133 @@ Table: transactions
   - status: varchar(20) (allowed: 'COMPLETED', 'PENDING', 'FAILED', 'CANCELLED')
   - created_at: timestamp with time zone
 `.trim();
+
+// Sensitive columns that must never be exposed or returned in query payloads
+export const SENSITIVE_COLUMNS = new Set([
+  'password_hash',
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'auth_token',
+  'api_key'
+]);
+
+// Blocked destructive, administrative, and multi-statement SQL keywords
+export const DESTRUCTIVE_KEYWORDS = [
+  'DROP',
+  'DELETE',
+  'UPDATE',
+  'INSERT',
+  'ALTER',
+  'TRUNCATE',
+  'CREATE',
+  'GRANT',
+  'REVOKE',
+  'COPY',
+  'EXECUTE',
+  'CALL',
+  'VACUUM',
+  'REINDEX',
+  'PG_SLEEP'
+];
+
+/**
+ * Validates a SQL query string against security guardrails.
+ * Returns { valid: true } or { valid: false, error: string }
+ */
+export function validateQuery(sql_query) {
+  if (typeof sql_query !== 'string') {
+    return {
+      valid: false,
+      error: 'SECURITY BLOCKED: Invalid query format'
+    };
+  }
+
+  const trimmed = sql_query.trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      error: 'SECURITY BLOCKED: Query cannot be empty'
+    };
+  }
+
+  // Remove single-line comments (-- ...) and multi-line comments (/* ... */)
+  const queryWithoutComments = trimmed
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/--.*$/gm, '')
+    .trim();
+
+  if (!queryWithoutComments) {
+    return {
+      valid: false,
+      error: 'SECURITY BLOCKED: Query contains only comments or whitespace'
+    };
+  }
+
+  // Multi-statement check: disallow semicolons inside statement (allow only a single trailing semicolon)
+  const statementWithoutTrailingSemicolon = queryWithoutComments.replace(/;\s*$/, '');
+  if (statementWithoutTrailingSemicolon.includes(';')) {
+    return {
+      valid: false,
+      error: 'SECURITY BLOCKED: Multiple statements or chained queries are forbidden'
+    };
+  }
+
+  // Guardrail 1: Enforce read-only prefix (SELECT or WITH for CTEs)
+  const normalizedUpper = statementWithoutTrailingSemicolon.toUpperCase();
+  const startsWithSelect = normalizedUpper.startsWith('SELECT');
+  const startsWithWith = normalizedUpper.startsWith('WITH');
+
+  if (!startsWithSelect && !startsWithWith) {
+    return {
+      valid: false,
+      error: 'SECURITY BLOCKED: Query must start with SELECT '
+    };
+  }
+
+  // Guardrail 2: Block destructive or administrative keywords using word boundaries
+  for (const keyword of DESTRUCTIVE_KEYWORDS) {
+    const keywordRegex = new RegExp(`\\b${keyword}\\b`, 'i');
+    if (keywordRegex.test(statementWithoutTrailingSemicolon)) {
+      return {
+        valid: false,
+        error: `SECURITY BLOCKED: Destructive keyword detected: ${keyword}`
+      };
+    }
+  }
+
+  // Guardrail 3: Explicit access to sensitive columns (like password_hash)
+  for (const col of SENSITIVE_COLUMNS) {
+    const colRegex = new RegExp(`\\b${col}\\b`, 'i');
+    if (colRegex.test(statementWithoutTrailingSemicolon)) {
+      return {
+        valid: false,
+        error: `SECURITY BLOCKED: Access to sensitive column ${col.toUpperCase()} is forbidden`
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Redacts any sensitive columns from returned database rows (defense-in-depth against SELECT *)
+ */
+export function sanitizeRows(rows) {
+  if (!Array.isArray(rows)) return rows;
+
+  return rows.map((row) => {
+    if (!row || typeof row !== 'object') return row;
+    const cleanRow = { ...row };
+    for (const key of Object.keys(cleanRow)) {
+      if (SENSITIVE_COLUMNS.has(key.toLowerCase())) {
+        cleanRow[key] = '[REDACTED_BY_SECURITY_GUARDRAIL]';
+      }
+    }
+    return cleanRow;
+  });
+}
 
 // 3. Tool 1: get_schema - returns the sanitized database schema
 server.tool(
@@ -62,50 +189,14 @@ server.tool(
     sql_query: z.string().describe('The SELECT SQL query to execute')
   },
   async ({ sql_query }) => {
-    // Pure string manipulation for security guardrails
-    const trimmedQuery = typeof sql_query === 'string' ? sql_query.trim() : '';
-    const upperQuery = trimmedQuery.toUpperCase();
-
-    // Guardrail 1: Convert query to uppercase and enforce it MUST start with "SELECT "
-    if (!upperQuery.startsWith('SELECT ')) {
+    // Validate SQL query against guardrails
+    const validation = validateQuery(sql_query);
+    if (!validation.valid) {
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              error: 'SECURITY BLOCKED: Query must start with SELECT '
-            })
-          }
-        ]
-      };
-    }
-
-    // Guardrail 2: Block destructive keywords
-    const destructiveKeywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE'];
-    for (const keyword of destructiveKeywords) {
-      if (upperQuery.includes(keyword)) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                error: `SECURITY BLOCKED: Destructive keyword detected: ${keyword}`
-              })
-            }
-          ]
-        };
-      }
-    }
-
-    // Guardrail 3: Block access to password_hash
-    if (upperQuery.includes('PASSWORD_HASH')) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: 'SECURITY BLOCKED: Access to sensitive column PASSWORD_HASH is forbidden'
-            })
+            text: JSON.stringify({ error: validation.error })
           }
         ]
       };
@@ -114,11 +205,12 @@ server.tool(
     // Passed all guardrails: execute query safely
     try {
       const result = await pool.query(sql_query);
+      const sanitizedData = sanitizeRows(result.rows);
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result.rows, null, 2)
+            text: JSON.stringify(sanitizedData, null, 2)
           }
         ]
       };

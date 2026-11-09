@@ -94,7 +94,7 @@ The Model Context Protocol (MCP) server implements strict zero-trust defenses be
 
 ### Step 1: Start the PostgreSQL Database
 
-Navigate to the `database` directory and start the container:3:38 PM
+Navigate to the `database` directory and start the container:
 
 
 ```bash

@@ -13,7 +13,7 @@ export default function App() {
       id: 1,
       role: 'assistant',
       content: 'Welcome to the Fintech MCP Analytics Terminal. I am your AI agent secured by string-level AST guardrails and a read-only database gateway. Ask a financial question or run an attack test.',
-      timestamp: new Date().toLocaleTimeString()
+      timestamp: 'Session Init'
     }
   ]);
   const [inputValue, setInputValue] = useState('');
@@ -46,10 +46,15 @@ export default function App() {
     setIsLoading(true);
 
     try {
-      const response = await fetch('http://localhost:3000/api/chat', {
+      const chatHistory = messages
+        .filter((m) => !m.isError)
+        .slice(-8)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: query })
+        body: JSON.stringify({ message: query, history: chatHistory })
       });
 
       if (!response.ok) {
@@ -265,7 +270,7 @@ export default function App() {
           </div>
           <div className="flex items-center space-x-2 text-xs">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-            <span className="text-neutral-400 text-[11px]">PORT: 5432 SECURED</span>
+            <span className="text-neutral-400 text-[11px]">PORT: 5434 SECURED</span>
           </div>
         </div>
 

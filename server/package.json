@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/guardrails.test.js",
+    "db:check": "node test/db_healthcheck.js"
   },
   "keywords": [],
   "author": "",

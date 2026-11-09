@@ -19,10 +19,10 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || 'ollama'
 });
 
-// Select model: configurable via env, defaulting to locally available model
+// Select model: configurable via env, defaulting to gemma4:12b
 const LLM_MODEL = process.env.LLM_MODEL || 'gemma4:12b';
 
-// 4. OpenAI tool definitions corresponding to secure MCP tools
+// 3. OpenAI tool definitions corresponding to secure MCP tools
 const MCP_TOOLS = [
   {
     type: 'function',
@@ -59,19 +59,29 @@ const MCP_TOOLS = [
 const SYSTEM_PROMPT = `
 You are a Senior Data Security & Analytics Assistant for a fintech platform.
 You have access to MCP tools:
-- get_schema: retrieve available tables and allowed columns.
+- get_schema: retrieve available tables and allowed columns. Call this if you need to know the schema before querying.
 - run_select_query: execute validated read-only SELECT queries.
 Rules:
 - Never attempt to modify or destroy data (no INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE).
 - Never request or query sensitive authentication data (e.g., PASSWORD_HASH).
 - Always use the tools when database information is requested.
+- If a security guardrail blocks a query, politely explain the security policy violation.
 - Provide clear, professional plain-English answers based on the tool results.
 `.trim();
 
-// 3. POST route /api/chat
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    model: LLM_MODEL,
+    mcp_tools: MCP_TOOLS.map((t) => t.function.name)
+  });
+});
+
+// 4. POST route /api/chat with Multi-Step Agentic Tool Calling & Conversation Memory
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, history } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({
@@ -79,95 +89,103 @@ app.post('/api/chat', async (req, res) => {
       });
     }
 
-    const conversationHistory = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: message }
-    ];
+    // Build conversation history including prior turns if provided
+    const conversationHistory = [{ role: 'system', content: SYSTEM_PROMPT }];
 
-    // 4. Initial call to LLM with tool definitions
-    const firstResponse = await openai.chat.completions.create({
-      model: LLM_MODEL,
-      messages: conversationHistory,
-      tools: MCP_TOOLS,
-      tool_choice: 'auto'
-    });
+    if (Array.isArray(history)) {
+      for (const item of history.slice(-8)) {
+        if (item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string') {
+          conversationHistory.push({ role: item.role, content: item.content });
+        }
+      }
+    }
 
-    const choiceMessage = firstResponse.choices[0]?.message;
-    const toolCalls = choiceMessage?.tool_calls;
+    // Add current user request
+    conversationHistory.push({ role: 'user', content: message });
 
-    // 5. Intercept tool_calls if generated
-    if (toolCalls && toolCalls.length > 0) {
-      const toolCall = toolCalls[0];
-      const toolName = toolCall.function.name;
+    let currentIteration = 0;
+    const MAX_ITERATIONS = 5;
+    let latestAuditLog = null;
 
-      let toolArgs = {};
-      try {
-        toolArgs = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
-      } catch (parseErr) {
-        console.warn('Failed to parse tool arguments:', parseErr);
-        toolArgs = {};
+    // Agentic Loop: executes tools until LLM produces a final answer or max iterations reached
+    while (currentIteration < MAX_ITERATIONS) {
+      currentIteration++;
+
+      const response = await openai.chat.completions.create({
+        model: LLM_MODEL,
+        messages: conversationHistory,
+        tools: MCP_TOOLS,
+        tool_choice: 'auto'
+      });
+
+      const choiceMessage = response.choices[0]?.message;
+      if (!choiceMessage) {
+        break;
       }
 
-      // 6. Invoke the corresponding MCP tool directly
-      let resultText = '';
-      try {
-        const toolResult = await executeTool(toolName, toolArgs);
-        resultText = toolResult?.content?.[0]?.text || '';
-      } catch (toolExecError) {
-        resultText = JSON.stringify({
-          error: `Tool execution failed: ${toolExecError.message}`
+      const toolCalls = choiceMessage.tool_calls;
+
+      // When no further tools are requested, we have the final assistant response
+      if (!toolCalls || toolCalls.length === 0) {
+        const finalAnswer = choiceMessage.content || choiceMessage.reasoning_content || 'No response generated.';
+        return res.json({
+          answer: finalAnswer,
+          audit_log: latestAuditLog || {
+            action: 'none',
+            query_attempted: null,
+            status: 'VALIDATED',
+            raw_data: null
+          }
         });
       }
 
-      // Audit status evaluation
-      const isBlocked = resultText.includes('SECURITY BLOCKED');
-      const auditLog = {
-        action: toolName,
-        query_attempted: toolArgs.sql_query || null,
-        status: isBlocked ? 'BLOCKED' : 'VALIDATED',
-        raw_data: resultText
-      };
-
-      // 7. Send tool execution result back to LLM for final plain-English answer
+      // Record assistant choice message containing tool calls
       conversationHistory.push(choiceMessage);
-      conversationHistory.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: resultText
-      });
 
-      const secondResponse = await openai.chat.completions.create({
-        model: LLM_MODEL,
-        messages: conversationHistory
-      });
-
-      const secondMsg = secondResponse.choices[0]?.message;
-      let finalAnswer = secondMsg?.content || secondMsg?.reasoning_content;
-
-      if (!finalAnswer || !finalAnswer.trim()) {
-        if (isBlocked) {
-          finalAnswer = `Security policy blocked the requested database operation. Details: ${resultText}`;
-        } else {
-          finalAnswer = `The query was executed successfully against the database. Telemetry and raw records are available in the Live Security Audit Log.`;
+      // Execute all tool calls in parallel or sequence and collect responses
+      for (const toolCall of toolCalls) {
+        const toolName = toolCall.function.name;
+        let toolArgs = {};
+        try {
+          toolArgs = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
+        } catch (parseErr) {
+          console.warn('Failed to parse tool arguments:', parseErr);
+          toolArgs = {};
         }
-      }
 
-      // 8. Return response containing exactly two keys: answer and audit_log
-      return res.json({
-        answer: finalAnswer,
-        audit_log: auditLog
-      });
+        let resultText = '';
+        try {
+          const toolResult = await executeTool(toolName, toolArgs);
+          resultText = toolResult?.content?.[0]?.text || '';
+        } catch (toolExecError) {
+          resultText = JSON.stringify({
+            error: `Tool execution failed: ${toolExecError.message}`
+          });
+        }
+
+        const isBlocked = resultText.includes('SECURITY BLOCKED');
+        latestAuditLog = {
+          action: toolName,
+          query_attempted: toolArgs.sql_query || null,
+          status: isBlocked ? 'BLOCKED' : 'VALIDATED',
+          raw_data: resultText
+        };
+
+        // Add tool response to history for subsequent LLM reasoning turn
+        conversationHistory.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: resultText
+        });
+      }
     }
 
-    // Direct response when no tools were invoked
+    // Fallback if max iterations exceeded
     return res.json({
-      answer: choiceMessage?.content || 'No response generated.',
-      audit_log: {
-        action: 'none',
-        query_attempted: null,
-        status: 'VALIDATED',
-        raw_data: null
-      }
+      answer: latestAuditLog?.status === 'BLOCKED'
+        ? `Security policy blocked the database operation: ${latestAuditLog.raw_data}`
+        : 'Query was executed. Please inspect the audit log for telemetry results.',
+      audit_log: latestAuditLog
     });
 
   } catch (error) {
