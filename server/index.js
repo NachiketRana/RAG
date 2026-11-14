@@ -16,7 +16,9 @@ app.use(express.json());
 // 2. Initialize OpenAI SDK pointing to local Ollama (or custom baseURL / OpenAI via env)
 const openai = new OpenAI({
   baseURL: process.env.OPENAI_BASE_URL || 'http://localhost:11434/v1',
-  apiKey: process.env.OPENAI_API_KEY || 'ollama'
+  apiKey: process.env.OPENAI_API_KEY || 'ollama',
+  timeout: 45000,
+  maxRetries: 1
 });
 
 // Select model: configurable via env, defaulting to gemma4:12b
