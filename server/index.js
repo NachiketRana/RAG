@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
-import { executeTool } from './mcp_server.js';
+import { executeTool, pool } from './mcp_server.js';
 
 dotenv.config();
 
@@ -172,6 +172,12 @@ app.post('/api/chat', async (req, res) => {
           status: isBlocked ? 'BLOCKED' : 'VALIDATED',
           raw_data: resultText
         };
+
+        // Persist audit record to PostgreSQL ledger (non-blocking)
+        pool.query(
+          'INSERT INTO audit_logs (action, query_attempted, status, raw_data) VALUES ($1, $2, $3, $4)',
+          [toolName, toolArgs.sql_query || null, isBlocked ? 'BLOCKED' : 'VALIDATED', resultText]
+        ).catch(() => {});
 
         // Add tool response to history for subsequent LLM reasoning turn
         conversationHistory.push({
